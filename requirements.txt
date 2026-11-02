@@ -1,0 +1,3 @@
+# Core runtime – no external dependencies for Day 1 (all mocked)
+# Testing
+pytest>=7.4

@@ -1,7 +1,12 @@
-"""Core agent loop with interruption handling support.
+"""Core agent loop with interruption handling and tool-calling support.
 
-Phase flow (normal):
+Phase flow (normal, no tool calls):
     IDLE -> LISTENING -> TRANSCRIBING -> LLM_STREAMING -> TTS_PLAYING -> IDLE
+
+Phase flow (tool call detected in LLM output):
+    ... -> LLM_STREAMING  [tool calls executed, context updated]
+                        -> LLM_STREAMING  [resume with tool results]
+                        -> TTS_PLAYING -> IDLE
 
 Phase flow (interrupted during TTS):
     ... -> TTS_PLAYING -> INTERRUPTED -> LISTENING -> ...
@@ -9,7 +14,7 @@ Phase flow (interrupted during TTS):
 
 import threading
 import time
-from typing import List, Optional, Dict, Callable, Iterator
+from typing import Callable, Dict, Iterator, List, Optional
 
 from voice_ops_agent.stt.engine import MockSTTEngine
 from voice_ops_agent.llm.engine import MockLLMEngine
@@ -17,13 +22,26 @@ from voice_ops_agent.tts.engine import MockTTSEngine
 from voice_ops_agent.audio.output import MockSpeaker
 from voice_ops_agent.agent.state import AgentState, StateMachine
 from voice_ops_agent.agent.interruption import InterruptionListener
+from voice_ops_agent.tools.parser import parse_tool_calls, strip_tool_calls, has_tool_call
+from voice_ops_agent.tools.registry import ToolRegistry
+from voice_ops_agent.agent.tool_executor import ToolExecutor
+from voice_ops_agent.tools.base import ToolCallIntent  # re-export for callers
 
 
 class AgentLoop:
     """
     Orchestrates a single-turn (or multi-turn via interruption) voice round-trip:
 
-        audio_chunks  ->  STT  ->  LLM stream  ->  TTS stream  ->  speaker
+        audio_chunks  ->  STT  ->  LLM stream  ->  [tool calls]  ->  TTS  ->  speaker
+
+    Tool-calling
+    ------------
+    When the LLM response contains ``TOOL_CALL:<name>:<json>`` directives:
+    1. The directives are parsed from the accumulated stream output.
+    2. Each tool is executed via the ``ToolRegistry``.
+    3. Results are injected into the conversation context.
+    4. The LLM is called again with the enriched context to produce the
+       final spoken response.
 
     Interruption handling adds a parallel VAD listener during TTS playback.
     When the user speaks, playback and LLM streaming are cancelled and the
@@ -35,19 +53,21 @@ class AgentLoop:
     llm : MockLLMEngine
     tts : MockTTSEngine
     speaker : MockSpeaker
+    tool_registry : ToolRegistry, optional
+        If provided, tool-calling is enabled.
     on_transcript : callable, optional
-        Called with the STT transcript string as soon as it is ready.
     on_token : callable, optional
-        Called with each LLM token string as it streams in.
     on_response_complete : callable, optional
-        Called with the full assembled LLM response string.
     on_interrupt : callable, optional
-        Called (no arguments) when a user interruption is detected.
+    on_tool_call : callable, optional
+        ``on_tool_call(intent)`` fired before each tool execution.
+    on_tool_result : callable, optional
+        ``on_tool_result(result)`` fired after each tool execution.
     on_state_change : callable, optional
-        Called with (old_state, new_state) on every state transition.
     max_interruptions : int
-        Maximum number of interruptions allowed per ``run`` call before
-        giving up (default 3).  Guards against infinite re-entry loops.
+    max_tool_rounds : int
+        Maximum rounds of tool-call → LLM re-entry per turn (default 5).
+        Prevents infinite tool-calling loops.
     """
 
     def __init__(
@@ -56,36 +76,50 @@ class AgentLoop:
         llm: MockLLMEngine,
         tts: MockTTSEngine,
         speaker: MockSpeaker,
+        tool_registry: Optional[ToolRegistry] = None,
         on_transcript: Optional[Callable[[str], None]] = None,
         on_token: Optional[Callable[[str], None]] = None,
         on_response_complete: Optional[Callable[[str], None]] = None,
         on_interrupt: Optional[Callable[[], None]] = None,
+        on_tool_call: Optional[Callable] = None,
+        on_tool_result: Optional[Callable] = None,
         on_state_change: Optional[Callable[[AgentState, AgentState], None]] = None,
         max_interruptions: int = 3,
+        max_tool_rounds: int = 5,
     ) -> None:
         self.stt = stt
         self.llm = llm
         self.tts = tts
         self.speaker = speaker
+        self.tool_registry = tool_registry
         self.on_transcript = on_transcript
         self.on_token = on_token
         self.on_response_complete = on_response_complete
         self.on_interrupt = on_interrupt
+        self.on_tool_call = on_tool_call
+        self.on_tool_result = on_tool_result
         self.on_state_change = on_state_change
         self.max_interruptions = max_interruptions
+        self.max_tool_rounds = max_tool_rounds
 
         self.state_machine = StateMachine(AgentState.IDLE)
-        # Latency bookkeeping (populated after run())
         self.timings: Dict[str, float] = {}
-        # Number of interruptions that occurred in the last run()
         self.interruption_count: int = 0
+
+        # Tool executor (created lazily when registry is provided)
+        self._tool_executor: Optional[ToolExecutor] = None
+        if self.tool_registry is not None:
+            self._tool_executor = ToolExecutor(
+                registry=self.tool_registry,
+                on_tool_call=self.on_tool_call,
+                on_tool_result=self.on_tool_result,
+            )
 
     # ------------------------------------------------------------------
     # State helpers
     # ------------------------------------------------------------------
 
     def _transition(self, new_state: AgentState) -> None:
-        """Perform a state transition and invoke on_state_change callback."""
         old_state = self.state_machine.state
         self.state_machine.transition(new_state)
         if self.on_state_change:
@@ -103,20 +137,15 @@ class AgentLoop:
         vad=None,
     ) -> Dict:
         """
-        Execute one full voice round-trip (with optional interruption handling).
+        Execute one full voice round-trip (with optional interruption and
+        tool-calling).
 
         Parameters
         ----------
         audio_chunks : list of bytes
-            Raw PCM audio from the microphone / VAD.
         context : list of dict, optional
-            Conversation history passed to the LLM.
         interrupt_audio_source : callable, optional
-            If provided, interruption handling is enabled.  Should be a
-            zero-argument callable returning PCM bytes (or None when idle).
         vad : EnergyVAD, optional
-            VAD instance used by the interruption listener.  Required when
-            *interrupt_audio_source* is provided.
 
         Returns
         -------
@@ -124,24 +153,30 @@ class AgentLoop:
             {
                 "transcript"         : str,
                 "llm_response"       : str,
-                "timings"            : dict of float (seconds),
+                "timings"            : dict,
                 "stt_result"         : dict,
                 "interrupted"        : bool,
                 "interruption_count" : int,
-                "state_history"      : list of AgentState,
+                "state_history"      : list,
+                "tool_calls"         : list of ToolCallIntent,
+                "tool_results"       : list of ToolResult,
             }
         """
         self.timings = {}
         self.interruption_count = 0
         self.state_machine.reset()
 
+        if context is None:
+            context = []
+
         t_start = time.perf_counter()
 
-        # Will hold the final values after (possible) re-entry
         final_transcript = ""
         final_llm_response = ""
         final_stt_result: Dict = {}
         interrupted = False
+        all_tool_calls: List = []
+        all_tool_results: List = []
 
         current_audio = audio_chunks
 
@@ -165,36 +200,30 @@ class AgentLoop:
             if self.on_transcript:
                 self.on_transcript(transcript)
 
+            # Add user turn to context
+            context.append({"role": "user", "content": transcript})
+
             # ---------------------------------------------------------- #
-            # Phase 2: LLM_STREAMING                                      #
+            # Phase 2: LLM_STREAMING (with tool-call loop)                #
             # ---------------------------------------------------------- #
             self._transition(AgentState.LLM_STREAMING)
 
             t_llm_start = time.perf_counter()
             first_token_time: Optional[float] = None
-            tokens: List[str] = []
 
-            for token in self.llm.stream_response(transcript, context):
-                if first_token_time is None:
-                    first_token_time = time.perf_counter()
-                    self.timings.setdefault(
-                        "stt_to_first_token", first_token_time - t_stt_end
-                    )
-                    self.timings.setdefault(
-                        "llm_first_token_latency", first_token_time - t_llm_start
-                    )
-
-                tokens.append(token)
-
-                if self.on_token:
-                    self.on_token(token)
-
-            t_llm_end = time.perf_counter()
-            self.timings.setdefault(
-                "llm_total_latency", t_llm_end - t_llm_start
+            llm_response = self._run_llm_with_tools(
+                transcript=transcript,
+                context=context,
+                t_stt_end=t_stt_end,
+                t_llm_start=t_llm_start,
+                first_token_time_ref=[first_token_time],
+                all_tool_calls=all_tool_calls,
+                all_tool_results=all_tool_results,
             )
 
-            llm_response = "".join(tokens)
+            t_llm_end = time.perf_counter()
+            self.timings.setdefault("llm_total_latency", t_llm_end - t_llm_start)
+
             final_llm_response = llm_response
 
             if self.on_response_complete:
@@ -209,7 +238,6 @@ class AgentLoop:
             t_tts_start = time.perf_counter()
             first_audio_time: Optional[float] = None
 
-            # Set up interruption listener if audio source provided
             listener: Optional[InterruptionListener] = None
             if interrupt_audio_source is not None and vad is not None:
                 listener = InterruptionListener(
@@ -236,35 +264,26 @@ class AgentLoop:
 
                     played = self.speaker.play_chunk(chunk)
                     if not played:
-                        # Speaker was interrupted; abort TTS streaming
                         break
             finally:
                 if listener is not None:
                     listener.stop()
 
             t_tts_end = time.perf_counter()
-            self.timings.setdefault(
-                "tts_total_latency", t_tts_end - t_tts_start
-            )
+            self.timings.setdefault("tts_total_latency", t_tts_end - t_tts_start)
 
-            # Check if an interruption occurred
             if listener is not None and listener.was_interrupted:
                 interrupted = True
                 self.interruption_count += 1
                 self._transition(AgentState.INTERRUPTED)
 
-                if self.on_interrupt is None and self.on_state_change:
-                    # on_interrupt already called by listener; nothing extra needed
-                    pass
-
                 if self.interruption_count >= self.max_interruptions:
-                    # Give up re-trying
                     self._transition(AgentState.IDLE)
                     break
 
-                # Re-enter with captured audio
-                current_audio = listener.captured_chunks if listener.captured_chunks else current_audio
-                # State machine: INTERRUPTED -> LISTENING (handled at loop top)
+                current_audio = (
+                    listener.captured_chunks if listener.captured_chunks else current_audio
+                )
                 continue
 
             # Normal completion
@@ -281,4 +300,95 @@ class AgentLoop:
             "interrupted": interrupted,
             "interruption_count": self.interruption_count,
             "state_history": self.state_machine.history,
+            "tool_calls": all_tool_calls,
+            "tool_results": all_tool_results,
         }
+
+    # ------------------------------------------------------------------
+    # Internal: LLM streaming with tool-call loop
+    # ------------------------------------------------------------------
+
+    def _run_llm_with_tools(
+        self,
+        transcript: str,
+        context: List[Dict],
+        t_stt_end: float,
+        t_llm_start: float,
+        first_token_time_ref: List,
+        all_tool_calls: List,
+        all_tool_results: List,
+    ) -> str:
+        """
+        Stream LLM output, detect tool calls, execute them, inject results,
+        and re-invoke the LLM as needed.  Returns the final human-facing
+        response (tool-call directives stripped).
+        """
+        tool_round = 0
+        accumulated_response = ""
+
+        # The prompt for the first LLM call is the transcript; for
+        # subsequent (tool-result) calls we pass the enriched context.
+        current_prompt = transcript
+
+        while tool_round <= self.max_tool_rounds:
+            tokens: List[str] = []
+            first_token_time = first_token_time_ref[0]
+
+            for token in self.llm.stream_response(current_prompt, context):
+                if first_token_time is None:
+                    first_token_time = time.perf_counter()
+                    first_token_time_ref[0] = first_token_time
+                    self.timings.setdefault(
+                        "stt_to_first_token", first_token_time - t_stt_end
+                    )
+                    self.timings.setdefault(
+                        "llm_first_token_latency", first_token_time - t_llm_start
+                    )
+
+                tokens.append(token)
+
+                # Fire on_token only for non-tool-call tokens (we don't
+                # know yet whether this chunk has directives, so we
+                # buffer and emit after checking)
+
+            raw_response = "".join(tokens)
+
+            # Detect tool calls in the full response
+            if self._tool_executor is not None and has_tool_call(raw_response):
+                intents = parse_tool_calls(raw_response)
+                all_tool_calls.extend(intents)
+
+                # Execute tools and inject results into context
+                context = self._tool_executor.execute_all(intents, context)
+                all_tool_results.extend(
+                    entry["result"]
+                    for entry in self._tool_executor.execution_history[
+                        -len(intents):
+                    ]
+                )
+
+                # Build a follow-up prompt summarising tool results
+                summaries = " ".join(
+                    entry["result"].text_summary
+                    for entry in self._tool_executor.execution_history[-len(intents):]
+                )
+                current_prompt = (
+                    f"The following tool results are available: {summaries}. "
+                    "Please provide a helpful spoken response based on these results."
+                )
+                tool_round += 1
+                continue  # re-enter LLM with tool results
+
+            # No tool calls in this response – emit tokens via callback
+            clean_response = strip_tool_calls(raw_response)
+            if not clean_response:
+                clean_response = raw_response.strip()
+
+            for token in clean_response.split(" "):
+                if self.on_token:
+                    self.on_token(token + " ")
+
+            accumulated_response = clean_response
+            break  # done
+
+        return accumulated_response

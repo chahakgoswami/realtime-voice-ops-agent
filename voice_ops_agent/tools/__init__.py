@@ -8,6 +8,7 @@ from .mock_tools import (
     OrderStatusTool,
     KnowledgeBaseSearchTool,
 )
+from .destructive_tools import OrderCancelTool, DataDeleteTool
 
 __all__ = [
     "ToolRegistry",
@@ -17,4 +18,6 @@ __all__ = [
     "CalendarCheckTool",
     "OrderStatusTool",
     "KnowledgeBaseSearchTool",
+    "OrderCancelTool",
+    "DataDeleteTool",
 ]

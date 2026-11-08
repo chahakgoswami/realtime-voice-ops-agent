@@ -26,13 +26,52 @@ from voice_ops_agent.stt.engine import MockSTTEngine
 from voice_ops_agent.llm.engine import MockLLMEngine
 from voice_ops_agent.tts.engine import MockTTSEngine
 from voice_ops_agent.agent.loop import AgentLoop
+from voice_ops_agent.profiler import LatencyProfiler
 
 
 def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def _load_dotenv() -> None:
+    """Load a .env file from the current working directory, if present.
+
+    Uses the standard KEY=VALUE format, ignoring comments and blank lines.
+    Does NOT overwrite variables that are already set in the environment.
+    """
+    env_path = ".env"
+    if not os.path.exists(env_path):
+        return
+    try:
+        with open(env_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip()
+                # Strip inline comments
+                if "#" in value:
+                    value = value[:value.index("#")].strip()
+                # Remove surrounding quotes
+                if len(value) >= 2 and value[0] in ('"', "'") and value[-1] == value[0]:
+                    value = value[1:-1]
+                # Only set if not already in environment
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        pass
+
+
 def main() -> None:
+    # ------------------------------------------------------------------ #
+    # Load .env file (if present) before reading configuration             #
+    # ------------------------------------------------------------------ #
+    _load_dotenv()
+
     # ------------------------------------------------------------------ #
     # Configuration from environment variables                             #
     # ------------------------------------------------------------------ #
@@ -84,7 +123,7 @@ def main() -> None:
         sys.exit(0)
 
     # ------------------------------------------------------------------ #
-    # Step 2–4: STT → LLM → TTS via AgentLoop                             #
+    # Step 2–4: STT → LLM → TTS via AgentLoop + LatencyProfiler          #
     # ------------------------------------------------------------------ #
     def on_transcript(text: str) -> None:
         print(f"\n[voice-ops] STT transcript : \"{text}\"")
@@ -109,24 +148,19 @@ def main() -> None:
         on_response_complete=on_response_complete,
     )
 
-    print("[voice-ops] Starting agent loop…")
+    profiler = LatencyProfiler(loop)
+
+    print("[voice-ops] Starting agent loop\u2026")
     print("[voice-ops] LLM response: ", end="", flush=True)
 
-    result = loop.run(audio_chunks)
+    result = profiler.run_and_profile(audio_chunks)
 
     # ------------------------------------------------------------------ #
-    # Step 5: Report timings                                               #
+    # Step 5: Report timings via profiler                                  #
     # ------------------------------------------------------------------ #
-    timings = result["timings"]
     print()
-    print("[voice-ops] ── Latency report ────────────────────────────────")
-    print(f"  STT latency            : {timings.get('stt_latency', 0)*1000:.1f} ms")
-    print(f"  LLM first-token        : {timings.get('llm_first_token_latency', 0)*1000:.1f} ms")
-    print(f"  STT → first token      : {timings.get('stt_to_first_token', 0)*1000:.1f} ms")
-    print(f"  TTS first-chunk        : {timings.get('tts_first_chunk_latency', 0)*1000:.1f} ms")
-    print(f"  Total round-trip       : {timings.get('total_latency', 0)*1000:.1f} ms")
+    print("[voice-ops] " + profiler.report(result))
     print(f"  Speaker bytes played   : {speaker.total_bytes_played}")
-    print("[voice-ops] ─────────────────────────────────────────────────")
     print("[voice-ops] Round-trip complete.")
 
 
